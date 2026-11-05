@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -27,7 +28,7 @@ func TestAddGetAndIsolation(t *testing.T) {
 	s := openTestStore(t)
 
 	due := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second)
-	task, err := s.Add(ctx, 1, "купить молоко", &due)
+	task, err := s.Add(ctx, 1, "купить молоко", "", &due)
 	if err != nil {
 		t.Fatalf("Add() error: %v", err)
 	}
@@ -171,9 +172,113 @@ func TestDueReminders(t *testing.T) {
 	}
 }
 
+func TestPhotoFileID(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	due := now.Add(time.Hour)
+	task, err := s.Add(ctx, 1, "чек из магазина", "photo-file-id", &due)
+	if err != nil {
+		t.Fatalf("Add() error: %v", err)
+	}
+
+	got, err := s.Get(ctx, 1, task.ID)
+	if err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if got.PhotoFileID != "photo-file-id" {
+		t.Fatalf("Get().PhotoFileID = %q, want %q", got.PhotoFileID, "photo-file-id")
+	}
+
+	list, err := s.ListActive(ctx, 1, 0, 10)
+	if err != nil {
+		t.Fatalf("ListActive() error: %v", err)
+	}
+	if len(list) != 1 || list[0].PhotoFileID != "photo-file-id" {
+		t.Fatalf("ListActive() = %+v, want photo-file-id", list)
+	}
+
+	reminders, err := s.DueReminders(ctx, now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("DueReminders() error: %v", err)
+	}
+	if len(reminders) != 1 || reminders[0].PhotoFileID != "photo-file-id" {
+		t.Fatalf("DueReminders() = %+v, want photo-file-id", reminders)
+	}
+
+	plain, err := s.Add(ctx, 1, "без фото", "", nil)
+	if err != nil {
+		t.Fatalf("Add() without photo error: %v", err)
+	}
+	if plain.PhotoFileID != "" {
+		t.Fatalf("Add() without photo PhotoFileID = %q, want empty", plain.PhotoFileID)
+	}
+}
+
+func TestOpenUpgradesLegacySchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("sql.Open() error: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE tasks (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id     INTEGER NOT NULL,
+		text        TEXT    NOT NULL,
+		due_at      INTEGER,
+		reminded_at INTEGER,
+		done        INTEGER NOT NULL DEFAULT 0,
+		created_at  INTEGER NOT NULL
+	)`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	res, err := raw.Exec(`INSERT INTO tasks(user_id, text, created_at) VALUES(1, 'старая задача', 1700000000)`)
+	if err != nil {
+		t.Fatalf("insert legacy task: %v", err)
+	}
+	legacyID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("LastInsertId() error: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() legacy db error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("Close() error: %v", err)
+		}
+	})
+
+	legacy, err := s.Get(context.Background(), 1, legacyID)
+	if err != nil {
+		t.Fatalf("Get() legacy task error: %v", err)
+	}
+	if legacy.Text != "старая задача" || legacy.PhotoFileID != "" {
+		t.Fatalf("legacy task = %+v", legacy)
+	}
+
+	added, err := s.Add(context.Background(), 1, "с фото", "photo-file-id", nil)
+	if err != nil {
+		t.Fatalf("Add() after upgrade error: %v", err)
+	}
+	got, err := s.Get(context.Background(), 1, added.ID)
+	if err != nil {
+		t.Fatalf("Get() after upgrade error: %v", err)
+	}
+	if got.PhotoFileID != "photo-file-id" {
+		t.Fatalf("upgraded PhotoFileID = %q, want %q", got.PhotoFileID, "photo-file-id")
+	}
+}
+
 func mustAdd(t *testing.T, s *Store, userID int64, text string, due *time.Time) Task {
 	t.Helper()
-	task, err := s.Add(context.Background(), userID, text, due)
+	task, err := s.Add(context.Background(), userID, text, "", due)
 	if err != nil {
 		t.Fatalf("Add(%q) error: %v", text, err)
 	}
