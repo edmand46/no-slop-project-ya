@@ -1,0 +1,5 @@
+todo.db
+todo.db-*
+*.db
+*.db-*
+/bin/
