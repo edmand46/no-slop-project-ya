@@ -36,7 +36,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("open database: %v", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	b, err := bot.New(token, st, loc)
 	if err != nil {

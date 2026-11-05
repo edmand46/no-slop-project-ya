@@ -315,7 +315,7 @@ func (b *Bot) handleWhen(ctx context.Context, _ *telegram.Bot, update *models.Up
 	b.answer(ctx, cq, "", false)
 	b.edit(ctx, msg.Chat.ID, msg.ID, b.addedText(task), noButtons)
 	if task.PhotoFileID != "" {
-		b.sendPhoto(ctx, msg.Chat.ID, task.PhotoFileID, fmt.Sprintf("📷 Фото к задаче #%d", task.ID), nil)
+		_ = b.sendPhoto(ctx, msg.Chat.ID, task.PhotoFileID, fmt.Sprintf("📷 Фото к задаче #%d", task.ID), nil)
 	}
 }
 
@@ -493,7 +493,7 @@ func (b *Bot) handlePhotoView(ctx context.Context, _ *telegram.Bot, update *mode
 	}
 
 	b.answer(ctx, cq, "", false)
-	b.sendPhoto(ctx, cq.From.ID, task.PhotoFileID, fmt.Sprintf("#%d %s", task.ID, task.Text), nil)
+	_ = b.sendPhoto(ctx, cq.From.ID, task.PhotoFileID, fmt.Sprintf("#%d %s", task.ID, task.Text), nil)
 }
 
 func (b *Bot) refreshList(ctx context.Context, msg *models.Message, userID int64, page int) {
