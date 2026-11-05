@@ -48,15 +48,15 @@ func Open(path string) (*Store, error) {
 		done        INTEGER NOT NULL DEFAULT 0,
 		created_at  INTEGER NOT NULL
 	)`); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS tasks_user_done ON tasks(user_id, done)`); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS tasks_due ON tasks(due_at, reminded_at)`); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 
@@ -98,7 +98,7 @@ func (s *Store) ListActive(ctx context.Context, userID int64, offset, limit int)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var tasks []Task
 	for rows.Next() {
@@ -165,7 +165,7 @@ func (s *Store) DueReminders(ctx context.Context, now time.Time) ([]Task, error)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var tasks []Task
 	for rows.Next() {
