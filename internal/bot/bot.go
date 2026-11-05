@@ -31,6 +31,7 @@ var noButtons = &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKe
 type draft struct {
 	id      int64
 	text    string
+	photo   string
 	waiting bool
 }
 
@@ -67,6 +68,7 @@ func New(token string, st *store.Store, loc *time.Location) (*Bot, error) {
 	api.RegisterHandler(telegram.HandlerTypeCallbackQueryData, "l:", telegram.MatchTypePrefix, b.handlePage)
 	api.RegisterHandler(telegram.HandlerTypeCallbackQueryData, "t:", telegram.MatchTypePrefix, b.handleListDone)
 	api.RegisterHandler(telegram.HandlerTypeCallbackQueryData, "d:", telegram.MatchTypePrefix, b.handleListDelete)
+	api.RegisterHandler(telegram.HandlerTypeCallbackQueryData, "p:", telegram.MatchTypePrefix, b.handlePhotoView)
 	api.RegisterHandler(telegram.HandlerTypeCallbackQueryData, "rt:", telegram.MatchTypePrefix, b.handleReminderDone)
 	api.RegisterHandler(telegram.HandlerTypeCallbackQueryData, "rd:", telegram.MatchTypePrefix, b.handleReminderDelete)
 
@@ -114,6 +116,8 @@ func (b *Bot) handleHelp(ctx context.Context, _ *telegram.Bot, update *models.Up
 /list — активные задачи и кнопки «готово» / «удалить»
 /cancel — отменить добавление
 
+Фото с подписью — задача с картинкой: подпись станет текстом задачи. В /list у таких задач есть кнопка 📷.
+
 Время можно ввести так:
 06.11 18:00
 6 ноября в 18:00
@@ -142,7 +146,7 @@ func (b *Bot) handleAdd(ctx context.Context, _ *telegram.Bot, update *models.Upd
 		return
 	}
 
-	d := b.newDraft(msg.Chat.ID, text)
+	d := b.newDraft(msg.Chat.ID, text, "")
 	b.send(ctx, msg.Chat.ID, "Когда напомнить?\n"+text, b.whenKeyboard(d))
 }
 
@@ -179,11 +183,16 @@ func (b *Bot) handleList(ctx context.Context, _ *telegram.Bot, update *models.Up
 	b.send(ctx, msg.Chat.ID, text, markup)
 }
 
-// handleText is the default handler: it either parses the time for a waiting
-// draft or explains how to add a task.
+// handleText is the default handler: it handles photos, parses the time for a
+// waiting draft, or explains how to add a task.
 func (b *Bot) handleText(ctx context.Context, _ *telegram.Bot, update *models.Update) {
 	msg, ok := privateMessage(update)
 	if !ok {
+		return
+	}
+
+	if len(msg.Photo) > 0 {
+		b.handlePhoto(ctx, msg)
 		return
 	}
 
@@ -209,14 +218,38 @@ func (b *Bot) handleText(ctx context.Context, _ *telegram.Bot, update *models.Up
 		return
 	}
 
-	task, err := b.store.Add(ctx, msg.Chat.ID, d.text, &due)
+	task, err := b.store.Add(ctx, msg.Chat.ID, d.text, d.photo, &due)
 	if err != nil {
 		log.Printf("add task: %v", err)
 		b.send(ctx, msg.Chat.ID, "Не получилось сохранить задачу, попробуйте ещё раз.", nil)
 		return
 	}
 	b.removeDraft(msg.Chat.ID, d.id)
-	b.send(ctx, msg.Chat.ID, b.addedText(task), nil)
+	b.sendTask(ctx, msg.Chat.ID, b.addedText(task), task.PhotoFileID, nil)
+}
+
+func (b *Bot) handlePhoto(ctx context.Context, msg *models.Message) {
+	if len(msg.Photo) == 0 {
+		return
+	}
+	photo := msg.Photo[len(msg.Photo)-1].FileID
+	text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(msg.Caption), "/add"))
+
+	if text == "" {
+		if b.attachPhoto(msg.Chat.ID, photo) {
+			b.send(ctx, msg.Chat.ID, "📷 Фото прикреплено к задаче.", nil)
+			return
+		}
+		b.send(ctx, msg.Chat.ID, "Подпишите фото текстом задачи: отправьте его с подписью, например «купить молоко».", nil)
+		return
+	}
+	if utf8.RuneCountInString(text) > maxTaskRunes {
+		b.send(ctx, msg.Chat.ID, fmt.Sprintf("Слишком длинно: максимум %d символов.", maxTaskRunes), nil)
+		return
+	}
+
+	d := b.newDraft(msg.Chat.ID, text, photo)
+	b.send(ctx, msg.Chat.ID, "Когда напомнить?\n"+text, b.whenKeyboard(d))
 }
 
 func (b *Bot) handleWhen(ctx context.Context, _ *telegram.Bot, update *models.Update) {
@@ -245,6 +278,7 @@ func (b *Bot) handleWhen(ctx context.Context, _ *telegram.Bot, update *models.Up
 		return
 	}
 	draftText := d.text
+	draftPhoto := d.photo
 	if parts[2] == "other" {
 		d.waiting = true
 	}
@@ -271,7 +305,7 @@ func (b *Bot) handleWhen(ctx context.Context, _ *telegram.Bot, update *models.Up
 		due = &t
 	}
 
-	task, err := b.store.Add(ctx, userID, draftText, due)
+	task, err := b.store.Add(ctx, userID, draftText, draftPhoto, due)
 	if err != nil {
 		log.Printf("add task: %v", err)
 		b.answer(ctx, cq, "Не получилось сохранить задачу", true)
@@ -280,6 +314,9 @@ func (b *Bot) handleWhen(ctx context.Context, _ *telegram.Bot, update *models.Up
 	b.removeDraft(userID, draftID)
 	b.answer(ctx, cq, "", false)
 	b.edit(ctx, msg.Chat.ID, msg.ID, b.addedText(task), noButtons)
+	if task.PhotoFileID != "" {
+		_ = b.sendPhoto(ctx, msg.Chat.ID, task.PhotoFileID, fmt.Sprintf("📷 Фото к задаче #%d", task.ID), nil)
+	}
 }
 
 func (b *Bot) handlePage(ctx context.Context, _ *telegram.Bot, update *models.Update) {
@@ -382,7 +419,7 @@ func (b *Bot) handleReminderDone(ctx context.Context, _ *telegram.Bot, update *m
 	switch {
 	case errors.Is(err, store.ErrNoTask):
 		b.answer(ctx, cq, "Задача уже удалена", true)
-		b.edit(ctx, msg.Chat.ID, msg.ID, "Задача уже удалена", noButtons)
+		b.editReminder(ctx, msg, "Задача уже удалена")
 		return
 	case err != nil:
 		log.Printf("get task: %v", err)
@@ -398,7 +435,7 @@ func (b *Bot) handleReminderDone(ctx context.Context, _ *telegram.Bot, update *m
 		}
 	}
 	b.answer(ctx, cq, "Готово ✅", false)
-	b.edit(ctx, msg.Chat.ID, msg.ID, "✅ Готово: "+task.Text, noButtons)
+	b.editReminder(ctx, msg, "✅ Готово: "+task.Text)
 }
 
 func (b *Bot) handleReminderDelete(ctx context.Context, _ *telegram.Bot, update *models.Update) {
@@ -416,7 +453,7 @@ func (b *Bot) handleReminderDelete(ctx context.Context, _ *telegram.Bot, update 
 	switch {
 	case errors.Is(err, store.ErrNoTask):
 		b.answer(ctx, cq, "Задача уже удалена", true)
-		b.edit(ctx, msg.Chat.ID, msg.ID, "Задача уже удалена", noButtons)
+		b.editReminder(ctx, msg, "Задача уже удалена")
 		return
 	case err != nil:
 		log.Printf("delete task: %v", err)
@@ -424,7 +461,39 @@ func (b *Bot) handleReminderDelete(ctx context.Context, _ *telegram.Bot, update 
 		return
 	}
 	b.answer(ctx, cq, "Удалено", false)
-	b.edit(ctx, msg.Chat.ID, msg.ID, "🗑 Удалено: "+task.Text, noButtons)
+	b.editReminder(ctx, msg, "🗑 Удалено: "+task.Text)
+}
+
+func (b *Bot) handlePhotoView(ctx context.Context, _ *telegram.Bot, update *models.Update) {
+	cq, msg, ok := callbackContext(update)
+	if !ok {
+		return
+	}
+
+	page, taskID, ok := listCallback(cq.Data)
+	if !ok {
+		b.answer(ctx, cq, "Некорректная кнопка", true)
+		return
+	}
+
+	task, err := b.store.Get(ctx, cq.From.ID, taskID)
+	switch {
+	case errors.Is(err, store.ErrNoTask):
+		b.answer(ctx, cq, "Задача уже удалена", true)
+		b.refreshList(ctx, msg, cq.From.ID, page)
+		return
+	case err != nil:
+		log.Printf("get task: %v", err)
+		b.answer(ctx, cq, "Ошибка, попробуйте ещё раз", true)
+		return
+	}
+	if task.PhotoFileID == "" {
+		b.answer(ctx, cq, "У задачи нет фото", true)
+		return
+	}
+
+	b.answer(ctx, cq, "", false)
+	_ = b.sendPhoto(ctx, cq.From.ID, task.PhotoFileID, fmt.Sprintf("#%d %s", task.ID, task.Text), nil)
 }
 
 func (b *Bot) refreshList(ctx context.Context, msg *models.Message, userID int64, page int) {
@@ -467,7 +536,11 @@ func (b *Bot) renderList(ctx context.Context, userID int64, page int) (string, m
 		fmt.Fprintf(&sb, "Ваши задачи (%d–%d из %d):", first, last, count)
 	}
 	for _, task := range tasks {
-		fmt.Fprintf(&sb, "\n\n#%d %s", task.ID, task.Text)
+		fmt.Fprintf(&sb, "\n\n#%d ", task.ID)
+		if task.PhotoFileID != "" {
+			sb.WriteString("📷 ")
+		}
+		sb.WriteString(task.Text)
 		if task.DueAt != nil {
 			fmt.Fprintf(&sb, " — до %s", b.fmtDue(*task.DueAt))
 		}
@@ -475,10 +548,14 @@ func (b *Bot) renderList(ctx context.Context, userID int64, page int) (string, m
 
 	rows := make([][]models.InlineKeyboardButton, 0, len(tasks)+1)
 	for _, task := range tasks {
-		rows = append(rows, []models.InlineKeyboardButton{
+		row := []models.InlineKeyboardButton{
 			{Text: fmt.Sprintf("✅ #%d", task.ID), CallbackData: fmt.Sprintf("t:%d:%d", page, task.ID)},
-			{Text: fmt.Sprintf("🗑 #%d", task.ID), CallbackData: fmt.Sprintf("d:%d:%d", page, task.ID)},
-		})
+		}
+		if task.PhotoFileID != "" {
+			row = append(row, models.InlineKeyboardButton{Text: fmt.Sprintf("📷 #%d", task.ID), CallbackData: fmt.Sprintf("p:%d:%d", page, task.ID)})
+		}
+		row = append(row, models.InlineKeyboardButton{Text: fmt.Sprintf("🗑 #%d", task.ID), CallbackData: fmt.Sprintf("d:%d:%d", page, task.ID)})
+		rows = append(rows, row)
 	}
 	if pages > 1 {
 		var nav []models.InlineKeyboardButton
@@ -518,20 +595,7 @@ func (b *Bot) sendDueReminders(ctx context.Context) {
 	}
 
 	for _, task := range tasks {
-		text := fmt.Sprintf("%s\n#%d %s", reminderMessage, task.ID, task.Text)
-		if task.DueAt != nil {
-			text += "\nСрок: " + b.fmtDue(*task.DueAt)
-		}
-		keyboard := &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{{
-			{Text: "✅ готово", CallbackData: fmt.Sprintf("rt:%d", task.ID)},
-			{Text: "🗑 удалить", CallbackData: fmt.Sprintf("rd:%d", task.ID)},
-		}}}
-
-		if _, err := b.api.SendMessage(ctx, &telegram.SendMessageParams{
-			ChatID:      task.UserID,
-			Text:        text,
-			ReplyMarkup: keyboard,
-		}); err != nil {
+		if err := b.sendReminder(ctx, task); err != nil {
 			log.Printf("send reminder #%d: %v", task.ID, err)
 			continue
 		}
@@ -539,6 +603,29 @@ func (b *Bot) sendDueReminders(ctx context.Context) {
 			log.Printf("mark reminded #%d: %v", task.ID, err)
 		}
 	}
+}
+
+func (b *Bot) sendReminder(ctx context.Context, task store.Task) error {
+	text := fmt.Sprintf("%s\n#%d %s", reminderMessage, task.ID, task.Text)
+	if task.DueAt != nil {
+		text += "\nСрок: " + b.fmtDue(*task.DueAt)
+	}
+	keyboard := &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{{
+		{Text: "✅ готово", CallbackData: fmt.Sprintf("rt:%d", task.ID)},
+		{Text: "🗑 удалить", CallbackData: fmt.Sprintf("rd:%d", task.ID)},
+	}}}
+
+	if task.PhotoFileID != "" {
+		if err := b.sendPhoto(ctx, task.UserID, task.PhotoFileID, text, keyboard); err == nil {
+			return nil
+		}
+	}
+	_, err := b.api.SendMessage(ctx, &telegram.SendMessageParams{
+		ChatID:      task.UserID,
+		Text:        text,
+		ReplyMarkup: keyboard,
+	})
+	return err
 }
 
 func (b *Bot) whenKeyboard(d *draft) *models.InlineKeyboardMarkup {
@@ -580,14 +667,26 @@ func (b *Bot) fmtDue(t time.Time) string {
 	return t.Format("02.01.2006 15:04")
 }
 
-func (b *Bot) newDraft(userID int64, text string) *draft {
+func (b *Bot) newDraft(userID int64, text, photo string) *draft {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	b.seq++
-	d := &draft{id: b.seq, text: text}
+	d := &draft{id: b.seq, text: text, photo: photo}
 	b.drafts[userID] = d
 	return d
+}
+
+func (b *Bot) attachPhoto(userID int64, photo string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	d := b.drafts[userID]
+	if d == nil {
+		return false
+	}
+	d.photo = photo
+	return true
 }
 
 func (b *Bot) waitingDraft(userID int64) *draft {
@@ -621,6 +720,29 @@ func (b *Bot) send(ctx context.Context, chatID int64, text string, markup models
 	}
 }
 
+func (b *Bot) sendTask(ctx context.Context, chatID int64, text, photoFileID string, markup models.ReplyMarkup) {
+	if photoFileID == "" {
+		b.send(ctx, chatID, text, markup)
+		return
+	}
+	if err := b.sendPhoto(ctx, chatID, photoFileID, text, markup); err != nil {
+		b.send(ctx, chatID, text, markup)
+	}
+}
+
+func (b *Bot) sendPhoto(ctx context.Context, chatID int64, fileID, caption string, markup models.ReplyMarkup) error {
+	_, err := b.api.SendPhoto(ctx, &telegram.SendPhotoParams{
+		ChatID:      chatID,
+		Photo:       &models.InputFileString{Data: fileID},
+		Caption:     caption,
+		ReplyMarkup: markup,
+	})
+	if err != nil {
+		log.Printf("send photo: %v", err)
+	}
+	return err
+}
+
 func (b *Bot) edit(ctx context.Context, chatID int64, messageID int, text string, markup models.ReplyMarkup) {
 	if _, err := b.api.EditMessageText(ctx, &telegram.EditMessageTextParams{
 		ChatID:      chatID,
@@ -629,6 +751,21 @@ func (b *Bot) edit(ctx context.Context, chatID int64, messageID int, text string
 		ReplyMarkup: markup,
 	}); err != nil {
 		log.Printf("edit message: %v", err)
+	}
+}
+
+func (b *Bot) editReminder(ctx context.Context, msg *models.Message, text string) {
+	if len(msg.Photo) == 0 {
+		b.edit(ctx, msg.Chat.ID, msg.ID, text, noButtons)
+		return
+	}
+	if _, err := b.api.EditMessageCaption(ctx, &telegram.EditMessageCaptionParams{
+		ChatID:      msg.Chat.ID,
+		MessageID:   msg.ID,
+		Caption:     text,
+		ReplyMarkup: noButtons,
+	}); err != nil {
+		log.Printf("edit caption: %v", err)
 	}
 }
 
